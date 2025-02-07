@@ -1,0 +1,578 @@
+---
+title: "HIV_Prediction"
+author: "Amanuel Belay"
+date: "2024-09-01"
+output:
+  word_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(skimr)
+library(tidymodels)
+library(GGally)
+library(usemodels)
+library(vip)
+library(themis)
+```
+
+```{r}
+hiv_bio <- read_csv("data/ephia2017adultbio.csv")
+hiv_int <- read_csv ("data/ephia2017adultind.csv")
+```
+
+```{r}
+skim(hiv_bio)
+```
+
+# merge the two data sets
+
+```{r}
+hiv_status <- hiv_bio %>%
+  select(personid, bt_status, hiv1statusfinalsurvey) 
+```
+
+```{r}
+hiv_full <- merge(hiv_int, hiv_status, by = "personid") %>%
+  mutate(hiv_result = case_when(hiv1statusfinalsurvey == 1 ~ "positive",
+                                hiv1statusfinalsurvey == 2 ~ "negative"),
+         gender = case_when(gender == 1 ~ "male",
+                            gender == 2 ~ "female"),
+         region = case_when(region == 1 ~ "Tigray",
+                            region == 2 ~ "Afar",
+                            region == 3 ~ "Amhara",
+                            region == 4 ~ "Oromia",
+                            region == 5 ~ "Somali",
+                            region == 6 ~ "Benishangul Gumuz",
+                            region == 7 ~ "SNNPR",
+                            region == 8 ~ "Gambella",
+                            region == 9 ~ "Harari",
+                            region == 10 ~ "Addis Ababa",
+                            region == 11 ~ "Dire Dawa")) %>%
+  select(-hiv1statusfinalsurvey) %>% 
+  filter(!is.na(hiv_result))
+```
+
+# Explor the data (EDA)
+```{r}
+hiv_full %>% count(hiv_result)
+```
+
+```{r}
+hiv_full %>% filter(!is.na(age)) %>%
+  ggplot(aes(x = hiv_result, y = age, fill = hiv_result)) +
+  geom_boxplot()
+```
+
+```{r}
+hiv_full %>% count(gender)
+
+hiv_full %>% count(hiv_result , gender) %>%
+  ggplot(aes(hiv_result, n, fill = gender)) +
+  geom_col()
+
+```
+
+```{r}
+hiv_full %>% count(region)
+
+hiv_full %>% group_by(region) %>% 
+  count(hiv_result) %>%
+  reframe(region = region,
+          result= hiv_result,
+          n = n,
+          prop = n/(sum(n))) %>%
+  ggplot(aes(region, prop, fill = result)) +
+  geom_col() +
+  scale_y_continuous(labels = scales::percent_format()) +
+  facet_wrap(~ result)
+
+```
+
+# Prepare data for modeling 
+## select variables for the model
+
+```{r}
+hiv_df <- hiv_full %>% select(hiv_result, region, gender, age, work12mo, religion, schlhi, schlat, occuptn, part12monum, evermar, curmar,	firstsxagedk,	hivtstever,	hivlikely, avoidpreg) %>% as_tibble()
+
+hiv_df <- hiv_df %>% mutate(occupation = case_when(work12mo == 2 ~ "no work",
+                                         occuptn == 1 ~ "PROFESSIONAL/TECHNICAL/MANAGERIAL",
+                                         occuptn == 2 ~ "CLERICAL",
+                                         occuptn == 3 ~ "SALES AND SERVICES",
+                                         occuptn == 4 ~ "SKILLED MANUAL",
+                                         occuptn == 5 ~ "UNSKILLED MANUAL",
+                                         occuptn == 6 ~ "AGRICULTURE",
+                                         occuptn == 7 ~ "HOUSE WIFE",
+                                         occuptn == 96 ~ "OTHER",
+                                         TRUE ~ NA),
+                            education = case_when(schlat == 2 ~ "no formal education",
+                                                   schlhi == 1 ~ "PRIMARY",
+                                                   schlhi == 2 ~ "SECONDARY",
+                                                   schlhi == 3 ~ "TECHNICAL/VOCATIONAL",
+                                                   schlhi == 4 ~ "HIGHER",
+                                                   TRUE ~ NA),
+                            sex_part = case_when(firstsxagedk == 96 ~ 0,
+                                                 part12monum == 0 ~ 0,
+                                                 part12monum == 1 ~ 1,
+                                                 part12monum == 2 ~ 2,
+                                                 part12monum == 3 ~ 3,
+                                                 part12monum == 4 ~ 4, 
+                                                 TRUE ~ NA),
+                            avoidpreg = case_when(avoidpreg == 2 ~ "No",
+                                                  avoidpreg == 1 ~ "Yes",
+                                                  TRUE ~ NA),
+                            religion = case_when(religion == 1 ~ "ORTHODOX",
+                                                 religion == 2 ~ "MUSLIM",
+                                                 religion == 4 ~ "PROTESTANT",
+                                                 religion == 96|3 ~ "OTHER",
+                                                 TRUE ~ NA),
+                            marital = case_when(evermar == 2 ~ "NEVER MARRIED",
+                                                curmar == 1 ~ "MARRIED",
+                                                curmar == 2 ~ "LIVING TOGETHER",
+                                                curmar == 3 ~ "WIDOWED",
+                                                curmar == 4 ~ "DIVORCED",
+                                                curmar == 5 ~ "SEPARATED",
+                                                TRUE ~ NA),
+                            # evermar = case_when(evermar == 1 ~ "Yes",
+                                                #evermar == 2 ~ "No",
+                                                #TRUE ~ NA),
+                           hivtstever = case_when(hivtstever == 1 ~ "Yes",
+                                                   hivtstever == 2 ~ "No",
+                                                   TRUE ~ NA),
+                            hivlikely = case_when(hivlikely == 1 ~ "VERY LIKELY",
+                                                  hivlikely == 2 ~ "SOMEWHAT LIKELY",
+                                                  hivlikely == 3 ~ "NOT LIKELY",
+                                                  hivlikely == -8 ~ "DON'T KNOW",
+                                                  TRUE ~ NA)) %>% mutate_if(is.character, factor) %>%
+  select(-c(work12mo,occuptn, schlat, schlhi, part12monum,firstsxagedk, evermar, curmar)) 
+
+
+#chisq.test(hiv_df$evermar, hiv_df$hiv_result) # X-squared = 177.61, df = 1, p-value < 2.2e-16
+#chisq.test(hiv_df$marital, hiv_df$hiv_result) #X-squared = 585.91, df = 5, p-value < 2.2e-16
+
+```
+
+
+# last EDA
+```{r}
+
+```
+
+```{r}
+hiv_df %>% select(hiv_result, age, marital, sex_part, education) %>% na.omit() %>% 
+  ggpairs(columns = 2:5, aes(color = hiv_result, alpha = 0.3))
+```
+
+
+
+
+# Build a Model
+## Split the data 
+
+```{r}
+set.seed(123)
+
+hiv_split <- initial_split(hiv_df, strata = hiv_result)
+hiv_train <- training(hiv_split)
+  
+hiv_test <- testing(hiv_split)
+
+
+set.seed(234)
+
+hiv_vfold <- vfold_cv(hiv_train, strata = hiv_result)
+
+metrics_set <- metric_set(roc_auc, accuracy, sens, spec)
+```
+
+
+# Logistic regression
+```{r}
+glmnet_recipe <- 
+  recipe(formula = hiv_result ~ ., data = hiv_train) %>% 
+  step_impute_knn(hivtstever, hivlikely, avoidpreg, occupation, education, sex_part, marital) %>%
+  step_zv(all_predictors()) %>% 
+  step_normalize(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors(), -hiv_result) %>%
+  step_smote(hiv_result)
+
+glmnet_spec <- 
+  logistic_reg(penalty = tune(), mixture = tune()) %>% 
+  set_mode("classification") %>% 
+  set_engine("glmnet") 
+
+glmnet_workflow <- 
+  workflow() %>% 
+  add_recipe(glmnet_recipe) %>% 
+  add_model(glmnet_spec) 
+
+glmnet_grid <- tidyr::crossing(penalty = 10^seq(-6, -1, length.out = 20), mixture = c(0.05,0.2, 0.4, 0.6, 0.8, 1)) 
+
+glmnet_tune <- 
+  tune_grid(glmnet_workflow, 
+            resamples = hiv_vfold,
+            grid = glmnet_grid,
+            metrics = metrics_set) 
+```
+
+
+## Explor the results
+
+```{r}
+# collect_metrics(glmnet_tune)
+show_best(glmnet_tune,metric =  "roc_auc")
+show_best(glmnet_tune, metric =  "accuracy")
+show_best(glmnet_tune, metric =  "sens")
+show_best(glmnet_tune, metric =  "spec")
+```
+
+```{r}
+autoplot(glmnet_tune)
+```
+
+
+## finalize the workflow with the best performing parameters
+
+```{r}
+final_glm <- glmnet_workflow %>%
+  finalize_workflow(select_best(glmnet_tune))
+
+final_glm
+```
+
+
+## fits the finalized model to the training data and evaluates on the testing data
+
+```{r}
+hiv_fit_glm <- last_fit(final_glm, hiv_split)
+hiv_fit_glm
+```
+
+
+```{r}
+collect_metrics(hiv_fit_glm)
+```
+
+```{r}
+collect_predictions(hiv_fit_glm) %>%
+  conf_mat(hiv_result, .pred_class) %>%
+  summary()
+```
+
+
+```{r}
+collect_predictions(hiv_fit_glm) %>%
+  conf_mat(hiv_result, .pred_class) %>%
+  autoplot(fill = "midnightblue")
+```
+
+
+## Feature importance
+
+```{r}
+imp_spec_glm <- glmnet_spec %>%
+  finalize_model(select_best(glmnet_tune)) %>%
+  set_engine("glmnet", importance = "permutation")
+
+workflow() %>%
+  add_recipe(glmnet_recipe) %>%
+  add_model(imp_spec_glm) %>%
+  fit(hiv_train) %>%
+  pull_workflow_fit() %>%
+  vip(aesthetics = list(alpha = 0.8, fill = "midnightblue"))
+```
+
+
+
+# Decision tree
+
+
+```{r}
+C50_recipe <- 
+  recipe(formula = hiv_result ~ ., data = hiv_train)%>%
+  step_impute_knn(hivtstever, hivlikely, avoidpreg, occupation, education, sex_part, marital) %>%
+  step_zv(all_predictors()) %>% 
+  step_normalize(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors(), -hiv_result) %>%
+  step_smote(hiv_result)
+
+C50_spec <- 
+  boost_tree(trees = tune(), min_n = tune()) %>% 
+  set_mode("classification") %>% 
+  set_engine("C5.0") 
+
+C50_workflow <- 
+  workflow() %>% 
+  add_recipe(C50_recipe) %>% 
+  add_model(C50_spec) 
+
+set.seed(71885)
+C50_tune <-
+  tune_grid(C50_workflow,
+            resamples = hiv_vfold,
+            grid = 10,
+            metrics = metrics_set)
+```
+
+
+## Explor the results
+
+```{r}
+# collect_metrics(C50_tune)
+show_best(C50_tune, metric =  "roc_auc")
+show_best(C50_tune, metric =  "accuracy")
+show_best(C50_tune, metric =  "sens")
+show_best(C50_tune, metric =  "spec")
+```
+
+```{r}
+autoplot(C50_tune)
+```
+
+
+## finalize the workflow with the best performing parameters
+
+```{r}
+final_C50 <- C50_workflow %>%
+  finalize_workflow(select_best(C50_tune))
+
+final_C50
+```
+
+
+## fits the finalized model to the training data and evaluates on the testing data
+
+```{r}
+hiv_fit_C50 <- last_fit(final_C50, hiv_split)
+hiv_fit_C50
+```
+
+
+```{r}
+collect_metrics(hiv_fit_C50)
+```
+
+```{r}
+collect_predictions(hiv_fit_C50) %>%
+  conf_mat(hiv_result, .pred_class) %>%
+  summary()
+```
+
+```{r}
+collect_predictions(hiv_fit_C50) %>%
+  conf_mat(hiv_result, .pred_class) %>%
+  autoplot(fill = "midnightblue")
+```
+
+#### Feature importance 
+
+```{r}
+imp_spec_C50 <- C50_spec %>%
+  finalize_model(select_best(C50_tune)) %>%
+  set_engine("C5.0", importance = "permutation")
+
+workflow() %>%
+  add_recipe(C50_recipe) %>%
+  add_model(imp_spec_C50) %>%
+  fit(hiv_train) %>%
+  pull_workflow_fit() %>%
+  vip(aesthetics = list(alpha = 0.8, fill = "midnightblue"))
+```
+
+
+
+# Random forest
+
+```{r}
+ranger_recipe <- 
+  recipe(formula = hiv_result ~ ., data = hiv_train) %>%
+  step_impute_knn(hivtstever, hivlikely, avoidpreg, occupation, education, sex_part, marital) %>%
+  step_zv(all_predictors()) %>% 
+  step_normalize(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors(), -hiv_result) %>%
+  step_smote(hiv_result)
+
+ranger_spec <- 
+  rand_forest(mtry = tune(), min_n = tune(), trees = 1000) %>% 
+  set_mode("classification") %>% 
+  set_engine("ranger") 
+
+ranger_workflow <- 
+  workflow() %>% 
+  add_recipe(ranger_recipe) %>% 
+  add_model(ranger_spec) 
+
+set.seed(28898)
+ranger_tune <-
+  tune_grid(ranger_workflow,
+            resamples = hiv_vfold,
+            grid = 10,
+            metrics = metrics_set)
+```
+
+
+## Explor the results
+
+```{r}
+# collect_metrics(ranger_tune)
+show_best(ranger_tune, metric =  "roc_auc")
+show_best(ranger_tune, metric =  "accuracy")
+show_best(ranger_tune, metric =  "sens")
+show_best(ranger_tune, metric =  "spec")
+```
+
+```{r}
+autoplot(ranger_tune)
+```
+
+## finalize the workflow with the best performing parameters
+
+```{r}
+final_rf <- ranger_workflow %>%
+  finalize_workflow(select_best(ranger_tune))
+
+final_rf
+```
+
+
+
+## fits the finalized model to the training data and evaluates on the testing data
+
+```{r}
+hiv_fit_rf <- last_fit(final_rf, hiv_split)
+hiv_fit_rf
+```
+
+
+```{r}
+collect_metrics(hiv_fit_rf)
+```
+
+
+```{r}
+collect_predictions(hiv_fit_rf) %>%
+  conf_mat(hiv_result, .pred_class) %>%
+  summary()
+```
+
+```{r}
+collect_predictions(hiv_fit_rf) %>%
+  conf_mat(hiv_result, .pred_class) %>%
+  autoplot(fill = "midnightblue")
+```
+
+
+## Feature importance
+
+```{r}
+imp_spec_rf <- ranger_spec %>%
+  finalize_model(select_best(ranger_tune)) %>%
+  set_engine("ranger", importance = "permutation")
+
+workflow() %>%
+  add_recipe(ranger_recipe) %>%
+  add_model(imp_spec_rf) %>%
+  fit(hiv_train) %>%
+  pull_workflow_fit() %>%
+  vip(aesthetics = list(alpha = 0.8, fill = "midnightblue"))
+```
+
+
+
+
+## Xgboost
+
+```{r}
+xgboost_recipe <- 
+  recipe(formula = hiv_result ~ ., data = hiv_train) %>% 
+  step_impute_knn(hivtstever, hivlikely, avoidpreg, occupation, education, sex_part, marital) %>%
+  step_zv(all_predictors()) %>% 
+  step_normalize(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors(), -hiv_result) %>%
+  step_smote(hiv_result) 
+
+xgboost_spec <- 
+  boost_tree(trees = tune(), min_n = tune(), tree_depth = tune(), learn_rate = tune(), 
+    loss_reduction = tune(), sample_size = tune()) %>% 
+  set_mode("classification") %>% 
+  set_engine("xgboost") 
+
+xgboost_workflow <- 
+  workflow() %>% 
+  add_recipe(xgboost_recipe) %>% 
+  add_model(xgboost_spec) 
+
+set.seed(25533)
+xgboost_tune <-
+  tune_grid(xgboost_workflow, 
+            resamples = hiv_vfold, 
+            grid = 10,
+            metrics = metrics_set)
+```
+
+
+```{r}
+show_best(xgboost_tune, metric =  "roc_auc")
+show_best(xgboost_tune, metric =  "accuracy")
+```
+
+
+
+## finalize the workflow with the best performing parameters
+
+```{r}
+final_xg <- xgboost_workflow %>%
+  finalize_workflow(select_best(xgboost_tune))
+
+final_xg
+```
+
+
+
+## fits the finalized model to the training data and evaluates on the testing data
+
+```{r}
+hiv_fit_xg <- last_fit(final_xg, hiv_split)
+hiv_fit_xg
+```
+
+
+```{r}
+collect_metrics(hiv_fit_xg)
+```
+
+
+```{r}
+collect_predictions(hiv_fit_xg) %>%
+  conf_mat(hiv_result, .pred_class) %>%
+  summary()
+```
+
+```{r}
+collect_predictions(hiv_fit_xg) %>%
+  conf_mat(hiv_result, .pred_class) %>%
+  autoplot(fill = "midnightblue")
+```
+
+
+## Feature importance
+
+```{r}
+imp_spec_xg <- xgboost_spec %>%
+  finalize_model(select_best(xgboost_tune)) %>%
+  set_engine("xgboost", importance = "permutation")
+
+workflow() %>%
+  add_recipe(xgboost_recipe) %>%
+  add_model(imp_spec_xg) %>%
+  fit(hiv_train) %>%
+  pull_workflow_fit() %>%
+  vip(aesthetics = list(alpha = 0.8, fill = "midnightblue"))
+```
+
+
